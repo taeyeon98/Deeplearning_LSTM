@@ -1,0 +1,420 @@
+import pandas as pd
+import numpy as np
+import datetime
+from pykrx import stock
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#######################################
+# 1. 함수/클래스 정의
+#######################################
+# (1) compute_accuracy
+def compute_accuracy(model, loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            logits = model(X_batch)
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == y_batch).sum().item()
+            total   += len(y_batch)
+    return correct / total if total > 0 else 0.0
+
+# (2) make_sequences_with_meta
+def make_sequences_with_meta(std_returns: pd.DataFrame,
+                             label_data: pd.DataFrame,
+                             window: int = 240):
+    X_list = []
+    y_list = []
+    meta_list = []
+
+    for stock in std_returns.columns:
+        stock_returns = std_returns[stock].values
+        stock_labels  = label_data[stock].values
+        dates_array   = std_returns.index.values
+
+        n = len(stock_returns)
+        for i in range(window, n):
+            seq_x = stock_returns[i-window:i]
+            seq_y = stock_labels[i]
+
+            if np.isnan(seq_y):
+                continue
+
+            t_date = dates_array[i]
+            seq_x = seq_x.reshape(-1, 1)
+            X_list.append(seq_x)
+            y_list.append(seq_y)
+            meta_list.append((t_date, stock))
+
+    X = np.array(X_list)
+    y = np.array(y_list)
+    return X, y, meta_list
+
+# (3) StockDatasetNoMeta
+class StockDatasetNoMeta(torch.utils.data.Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+    def __len__(self):
+        return len(self.X)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# (4) LSTMClassifier
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=25, num_classes=2, dropout=0.1, num_layers=1):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            dropout=dropout,
+            num_layers=num_layers
+        )
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last_out = out[:, -1, :]
+        logits = self.fc(last_out)
+        return logits
+
+# (5) calc_daily_returns, calc_sharpe_ratio
+def calc_daily_returns(pred_results, returns_df):
+    day_dict = {}
+    for (t_date, stock), label_pred in pred_results:
+        if label_pred == 1:
+            if t_date not in day_dict:
+                day_dict[t_date] = []
+            day_dict[t_date].append(stock)
+
+    daily_portfolio_ret = {}
+    sorted_dates = sorted(day_dict.keys())
+    for t_date in sorted_dates:
+        stocks_long = day_dict[t_date]
+        if len(stocks_long) == 0:
+            daily_portfolio_ret[t_date] = 0.0
+            continue
+
+        if t_date not in returns_df.index:
+            daily_portfolio_ret[t_date] = 0.0
+            continue
+        idx_pos = returns_df.index.get_loc(t_date)
+        if idx_pos == len(returns_df.index)-1:
+            daily_portfolio_ret[t_date] = 0.0
+            continue
+
+        next_date = returns_df.index[idx_pos+1]
+        rets = []
+        for s in stocks_long:
+            if s in returns_df.columns:
+                val = returns_df.loc[next_date, s]
+                if pd.notna(val):
+                    rets.append(val)
+        daily_ret = np.mean(rets) if len(rets)>0 else 0.0
+        daily_portfolio_ret[t_date] = daily_ret
+
+    port_series = pd.Series(daily_portfolio_ret).sort_index()
+    return port_series
+
+def calc_sharpe_ratio(daily_ret_series, annual_factor=252):
+    mean_daily = daily_ret_series.mean()
+    std_daily  = daily_ret_series.std()
+    if std_daily == 0 or pd.isna(std_daily):
+        return 0.0
+    sharpe = (mean_daily / std_daily)*np.sqrt(annual_factor)
+    return sharpe
+
+# (6) 단순전략 3개 + compute_accuracy_simple
+def predict_buy_hold(meta_test):
+    pred_results = []
+    for (t_date, stock) in meta_test:
+        pred_results.append(((t_date, stock), 1))
+    return pred_results
+
+def predict_1day_momentum(meta_test, returns_df):
+    pred_results = []
+    for (t_date, stock) in meta_test:
+        if t_date not in returns_df.index:
+            pred_label = 0
+        else:
+            val = returns_df.loc[t_date, stock]
+            if pd.isna(val):
+                pred_label = 0
+            else:
+                pred_label = 1 if val>0 else 0
+        pred_results.append(((t_date, stock), pred_label))
+    return pred_results
+
+def predict_1day_contrarian(meta_test, returns_df):
+    pred_results = []
+    for (t_date, stock) in meta_test:
+        if t_date not in returns_df.index:
+            pred_label = 0
+        else:
+            val = returns_df.loc[t_date, stock]
+            if pd.isna(val):
+                pred_label = 0
+            else:
+                pred_label = 1 if val<0 else 0
+        pred_results.append(((t_date, stock), pred_label))
+    return pred_results
+
+def compute_accuracy_simple(pred_results, label_df):
+    correct = 0
+    total = 0
+    for (t_date, stock), pred_label in pred_results:
+        if t_date not in label_df.index:
+            continue
+        idx_pos = label_df.index.get_loc(t_date)
+        if idx_pos == len(label_df.index)-1:
+            continue
+        next_date = label_df.index[idx_pos+1]
+        if stock not in label_df.columns:
+            continue
+        true_label = label_df.loc[next_date, stock]
+        if pd.notna(true_label):
+            total += 1
+            if int(true_label) == pred_label:
+                correct += 1
+    return correct/total if total>0 else 0.0
+
+
+#######################################
+# 2. 메인 코드 (Data 생성 -> LSTM & 단순전략 비교)
+#######################################
+results = []
+
+base_dates = [
+    "20211201",
+    "20201201"
+]
+
+for base_date in base_dates:
+    print("\n===========================================")
+    print(f"Processing base_date = {base_date}")
+
+    ############## (A) 데이터 전처리 ##############
+    # 1) 코스닥 시총 상위 300
+    kosdaq_tickers = stock.get_market_ticker_list(date=base_date, market="KOSDAQ")
+    market_cap_list = []
+    for ticker in kosdaq_tickers:
+        df_cap = stock.get_market_cap_by_date(base_date, base_date, ticker)
+        if len(df_cap)>0:
+            mc = df_cap.iloc[0]['시가총액']
+            market_cap_list.append((ticker, mc))
+
+    df_mc = pd.DataFrame(market_cap_list, columns=['ticker','market_cap'])
+    df_mc.sort_values(by='market_cap', ascending=False, inplace=True)
+    top300_tickers = df_mc.head(300)['ticker'].tolist()
+    print("Top 300 tickers (sample):", top300_tickers[:10], "...")
+
+    # 2) 5년 전 ~ base_date
+    base_year = int(base_date[:4])
+    base_mmdd = base_date[4:]
+    start_year = base_year - 5
+    start_date = f"{start_year}{base_mmdd}"
+    print(f"start_date = {start_date}, end_date = {base_date}")
+
+    # 3) 병합 -> merged_close
+    merged_close = pd.DataFrame()
+    for ticker in top300_tickers:
+        df_ohlcv = stock.get_market_ohlcv_by_date(start_date, base_date, ticker)
+        df_temp = df_ohlcv[['종가']].rename(columns={'종가':ticker})
+        if merged_close.empty:
+            merged_close = df_temp
+        else:
+            merged_close = merged_close.join(df_temp, how='outer')
+
+    # (결측 처리)
+    threshold = len(merged_close)*0.7
+    merged_close.dropna(thresh=threshold, axis=1, inplace=True)
+    for col in merged_close.columns:
+        fv_idx = merged_close[col].first_valid_index()
+        if fv_idx is not None:
+            earliest_price = merged_close.at[fv_idx, col]
+            merged_close[col].fillna(value=earliest_price, inplace=True)
+
+    # (상폐 간주)
+    min_check = 100
+    if len(merged_close)>=min_check:
+        cols_to_remove = []
+        for col in merged_close.columns:
+            last_100_values = merged_close[col].tail(min_check)
+            if last_100_values.nunique()==1:
+                cols_to_remove.append(col)
+        if cols_to_remove:
+            merged_close.drop(columns=cols_to_remove, inplace=True)
+            print(f"상폐로 간주 -> 제거된 종목: {len(cols_to_remove)}, {cols_to_remove}")
+
+    print("최종 DataFrame 크기:", merged_close.shape)
+
+    # 4) returns_df
+    close_df = merged_close.copy()
+    returns_df = close_df.pct_change(fill_method=None)
+    returns_df.dropna(how='all', inplace=True)
+    print("returns_df.shape:", returns_df.shape)
+
+    # 5) Study Period(3년+1년)
+    all_dates = returns_df.index
+    study_periods = []
+    start_i = 0
+    while True:
+        train_end_i = start_i+750
+        test_end_i  = start_i+1000
+        if test_end_i>len(all_dates):
+            break
+        train_dates = all_dates[start_i:train_end_i]
+        test_dates  = all_dates[train_end_i:test_end_i]
+        study_periods.append((train_dates, test_dates))
+        start_i += 250
+    print(f"총 스터디 기간 개수: {len(study_periods)}")
+
+    # 6) 라벨: t+1 > median
+    shifted = returns_df.shift(-1)
+    median_series = shifted.median(axis=1)
+    label_df = (shifted.gt(median_series, axis=0)).astype(int)
+
+    ############## (B) LSTM & 단순전략 비교 ##############
+    # study_periods를 돌면서 성과 기록
+    for idx_sp, (train_dates, test_dates) in enumerate(study_periods):
+        print(f"\n--- base_date={base_date}, Study Period {idx_sp+1} ---")
+        print(f"Train: {train_dates[0]} ~ {train_dates[-1]}")
+        print(f"Test:  {test_dates[0]} ~ {test_dates[-1]}")
+
+        # (1) 표준화
+        train_returns = returns_df.loc[train_dates, :]
+        test_returns  = returns_df.loc[test_dates, :]
+
+        train_mean = train_returns.stack().mean()
+        train_std  = train_returns.stack().std()
+
+        train_std_returns = (train_returns - train_mean)/train_std
+        test_std_returns  = (test_returns - train_mean)/train_std
+
+        # (2) make_sequences
+        X_train, y_train, meta_train = make_sequences_with_meta(train_std_returns,
+                                                               label_df.loc[train_dates,:],
+                                                               window=240)
+        X_test, y_test, meta_test   = make_sequences_with_meta(test_std_returns,
+                                                               label_df.loc[test_dates,:],
+                                                               window=240)
+        print("X_train:", X_train.shape, "y_train:", y_train.shape)
+        print("X_test :", X_test.shape,  "y_test :",  y_test.shape)
+
+        # (3) Dataset, DataLoader
+        train_dataset = StockDatasetNoMeta(X_train, y_train)
+        test_dataset  = StockDatasetNoMeta(X_test,  y_test)
+        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+        test_loader  = DataLoader(test_dataset, batch_size=512, shuffle=False)
+
+        # (4) LSTM 모델
+        model = LSTMClassifier(input_dim=1, hidden_dim=25, num_classes=2, dropout=0.1, num_layers=2).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
+
+        # (5) 학습 루프
+        num_epochs = 10
+        for ep in range(num_epochs):
+            model.train()
+            running_loss = 0.0
+            for X_b, y_b in train_loader:
+                X_b = X_b.to(device)
+                y_b = y_b.to(device)
+                optimizer.zero_grad()
+                logits = model(X_b)
+                loss = criterion(logits, y_b)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+
+        # (6) LSTM 결과
+        lstm_test_acc = compute_accuracy(model, test_loader, device)
+        model.eval()
+        preds_list = []
+        with torch.no_grad():
+            for X_b, y_b in test_loader:
+                X_b = X_b.to(device)
+                logits = model(X_b)
+                preds_b = torch.argmax(logits, dim=1)
+                preds_list.append(preds_b.cpu().numpy())
+        preds = np.concatenate(preds_list, axis=0)
+        pred_results = list(zip(meta_test, preds))
+
+        daily_ret_series = calc_daily_returns(pred_results, returns_df)
+        lstm_sharpe = calc_sharpe_ratio(daily_ret_series)
+        lstm_mean_ret = daily_ret_series.mean()
+
+        print(f"LSTM => Acc: {lstm_test_acc:.4f}, MeanRet: {lstm_mean_ret:.4%}, Sharpe: {lstm_sharpe:.2f}")
+
+        # (7) 단순전략 3개
+        # 7-1) Buy&Hold
+        hold_pred_results = predict_buy_hold(meta_test)
+        hold_acc = compute_accuracy_simple(hold_pred_results, label_df)
+        hold_daily_ret = calc_daily_returns(hold_pred_results, returns_df)
+        hold_sharpe = calc_sharpe_ratio(hold_daily_ret)
+        hold_mean = hold_daily_ret.mean()
+        print(f"Buy&Hold => Acc: {hold_acc:.4f}, MeanRet: {hold_mean:.4%}, Sharpe: {hold_sharpe:.2f}")
+
+        # 7-2) 1-Day Momentum
+        mom_pred_results = predict_1day_momentum(meta_test, returns_df)
+        mom_acc = compute_accuracy_simple(mom_pred_results, label_df)
+        mom_daily_ret = calc_daily_returns(mom_pred_results, returns_df)
+        mom_sharpe = calc_sharpe_ratio(mom_daily_ret)
+        mom_mean = mom_daily_ret.mean()
+        print(f"Momentum => Acc: {mom_acc:.4f}, MeanRet: {mom_mean:.4%}, Sharpe: {mom_sharpe:.2f}")
+
+        # 7-3) 1-Day Contrarian
+        con_pred_results = predict_1day_contrarian(meta_test, returns_df)
+        con_acc = compute_accuracy_simple(con_pred_results, label_df)
+        con_daily_ret = calc_daily_returns(con_pred_results, returns_df)
+        con_sharpe = calc_sharpe_ratio(con_daily_ret)
+        con_mean = con_daily_ret.mean()
+        print(f"Contrarian => Acc: {con_acc:.4f}, MeanRet: {con_mean:.4%}, Sharpe: {con_sharpe:.2f}")
+
+        # (8) 결과를 results 리스트에 append
+        results.append({
+            'base_date': base_date,
+            'study_period_index': idx_sp+1,
+            'train_start': train_dates[0],
+            'train_end': train_dates[-1],
+            'test_start': test_dates[0],
+            'test_end':   test_dates[-1],
+
+            # LSTM
+            'lstm_test_acc':  lstm_test_acc,
+            'lstm_mean_ret':  lstm_mean_ret,
+            'lstm_sharpe':    lstm_sharpe,
+
+            # Buy&Hold
+            'hold_test_acc':  hold_acc,
+            'hold_mean_ret':  hold_mean,
+            'hold_sharpe':    hold_sharpe,
+
+            # 1D Momentum
+            'mom_test_acc':   mom_acc,
+            'mom_mean_ret':   mom_mean,
+            'mom_sharpe':     mom_sharpe,
+
+            # 1D Contrarian
+            'con_test_acc':   con_acc,
+            'con_mean_ret':   con_mean,
+            'con_sharpe':     con_sharpe
+        })
+
+    print(f"=> process 완료 for base_date={base_date}")
+    print("-----------------------------------------------------------")
+
+# 마지막: results -> DataFrame
+df_res = pd.DataFrame(results)
+print("\n=== 최종 결과 DataFrame ===")
+print(df_res)
